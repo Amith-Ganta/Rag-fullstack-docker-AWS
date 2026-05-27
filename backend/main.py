@@ -15,21 +15,6 @@ import tempfile
 from pathlib import Path
 from datetime import datetime
 
-# LangChain imports
-from langchain_community.document_loaders import (
-    PyPDFLoader,
-    TextLoader,
-    UnstructuredWordDocumentLoader,
-)
-from langchain_community.vectorstores import Chroma
-from langchain_text_splitters import RecursiveCharacterTextSplitter
-from langchain_community.embeddings import HuggingFaceEmbeddings
-from langchain_groq import ChatGroq
-from langchain_core.prompts import ChatPromptTemplate
-from langchain_core.runnables import RunnablePassthrough
-from langchain_core.output_parsers import StrOutputParser
-from tavily import TavilyClient
-
 # Load environment variables
 load_dotenv()
 
@@ -37,26 +22,71 @@ load_dotenv()
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Initialize embeddings and vector store
-embeddings = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
-persist_directory = "/tmp/chroma_db"
-os.makedirs(persist_directory, exist_ok=True)
-vector_store = Chroma(
-    embedding_function=embeddings,
-    persist_directory=persist_directory,
-    collection_name="documents",
-)
+# Lazy initialization flags
+_embeddings = None
+_vector_store = None
+_llm = None
+_tavily_client = None
 
-# Initialize LLM
-groq_api_key = os.getenv("GROQ_API_KEY", "")
-if groq_api_key:
-    llm = ChatGroq(model="mixtral-8x7b-32768", api_key=groq_api_key, temperature=0.7)
-else:
-    llm = None
+def get_embeddings():
+    global _embeddings
+    if _embeddings is None:
+        try:
+            from langchain_community.embeddings import HuggingFaceEmbeddings
+            _embeddings = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
+        except Exception as e:
+            logger.error(f"Failed to initialize embeddings: {e}")
+            _embeddings = False
+    return _embeddings if _embeddings else None
 
-# Initialize Tavily for web search
-tavily_api_key = os.getenv("TAVILY_API_KEY", "")
-tavily_client = TavilyClient(api_key=tavily_api_key) if tavily_api_key else None
+def get_vector_store():
+    global _vector_store
+    if _vector_store is None:
+        try:
+            from langchain_community.vectorstores import Chroma
+            embeddings = get_embeddings()
+            if embeddings:
+                persist_directory = "/tmp/chroma_db"
+                os.makedirs(persist_directory, exist_ok=True)
+                _vector_store = Chroma(
+                    embedding_function=embeddings,
+                    persist_directory=persist_directory,
+                    collection_name="documents",
+                )
+        except Exception as e:
+            logger.error(f"Failed to initialize vector store: {e}")
+            _vector_store = False
+    return _vector_store if _vector_store else None
+
+def get_llm():
+    global _llm
+    if _llm is None:
+        try:
+            from langchain_groq import ChatGroq
+            groq_api_key = os.getenv("GROQ_API_KEY", "")
+            if groq_api_key:
+                _llm = ChatGroq(model="mixtral-8x7b-32768", api_key=groq_api_key, temperature=0.7)
+            else:
+                _llm = False
+        except Exception as e:
+            logger.error(f"Failed to initialize LLM: {e}")
+            _llm = False
+    return _llm if _llm else None
+
+def get_tavily_client():
+    global _tavily_client
+    if _tavily_client is None:
+        try:
+            from tavily import TavilyClient
+            tavily_api_key = os.getenv("TAVILY_API_KEY", "")
+            if tavily_api_key:
+                _tavily_client = TavilyClient(api_key=tavily_api_key)
+            else:
+                _tavily_client = False
+        except Exception as e:
+            logger.warning(f"Failed to initialize Tavily: {e}")
+            _tavily_client = False
+    return _tavily_client if _tavily_client else None
 
 # Initialize FastAPI app
 app = FastAPI(
@@ -131,6 +161,9 @@ async def query_rag(request: QueryRequest):
         - confidence: Confidence score of the answer
     """
     try:
+        llm = get_llm()
+        vector_store = get_vector_store()
+
         if not llm:
             raise HTTPException(
                 status_code=503,
@@ -139,24 +172,36 @@ async def query_rag(request: QueryRequest):
 
         logger.info(f"Processing query: {request.question}")
 
-        # Search for relevant documents
-        retriever = vector_store.as_retriever(search_kwargs={"k": 3})
-        docs = retriever.invoke(request.question)
+        sources = []
+        context = ""
 
-        sources = list(set([doc.metadata.get("source", "unknown") for doc in docs]))
-        context = "\n".join([doc.page_content for doc in docs])
+        # Search for relevant documents if vector store is available
+        if vector_store:
+            try:
+                retriever = vector_store.as_retriever(search_kwargs={"k": 3})
+                docs = retriever.invoke(request.question)
+                sources = list(set([doc.metadata.get("source", "unknown") for doc in docs]))
+                context = "\n".join([doc.page_content for doc in docs])
+            except Exception as e:
+                logger.warning(f"Vector search failed: {e}")
 
         # Optionally search web
         web_context = ""
-        if request.use_web_search and tavily_client:
-            try:
-                results = tavily_client.search(query=request.question, max_results=3)
-                web_context = "\n".join([r["content"] for r in results.get("results", [])])
-                sources.extend([r["url"] for r in results.get("results", [])])
-            except Exception as e:
-                logger.warning(f"Web search failed: {e}")
+        if request.use_web_search:
+            tavily_client = get_tavily_client()
+            if tavily_client:
+                try:
+                    results = tavily_client.search(query=request.question, max_results=3)
+                    web_context = "\n".join([r["content"] for r in results.get("results", [])])
+                    sources.extend([r["url"] for r in results.get("results", [])])
+                except Exception as e:
+                    logger.warning(f"Web search failed: {e}")
 
         # Build RAG prompt
+        from langchain_core.prompts import ChatPromptTemplate
+        from langchain_core.runnables import RunnablePassthrough
+        from langchain_core.output_parsers import StrOutputParser
+
         prompt = ChatPromptTemplate.from_template(
             """Use the following context to answer the question. If the context doesn't contain
             relevant information, use your knowledge but indicate that it's from your training data.
@@ -225,6 +270,13 @@ async def upload_document(file: UploadFile = File(...)):
             )
 
         logger.info(f"Uploading document: {file.filename}")
+        vector_store = get_vector_store()
+
+        if not vector_store:
+            raise HTTPException(
+                status_code=503,
+                detail="Vector store not available. Document indexing is disabled."
+            )
 
         # Save file to temporary location
         with tempfile.NamedTemporaryFile(delete=False, suffix=file_ext) as tmp_file:
@@ -236,12 +288,15 @@ async def upload_document(file: UploadFile = File(...)):
             # Load and extract text based on file type
             docs = []
             if file_ext == ".pdf":
+                from langchain_community.document_loaders import PyPDFLoader
                 loader = PyPDFLoader(tmp_path)
                 docs = loader.load()
             elif file_ext == ".txt":
+                from langchain_community.document_loaders import TextLoader
                 loader = TextLoader(tmp_path)
                 docs = loader.load()
             elif file_ext == ".docx":
+                from langchain_community.document_loaders import UnstructuredWordDocumentLoader
                 loader = UnstructuredWordDocumentLoader(tmp_path)
                 docs = loader.load()
 
@@ -249,6 +304,7 @@ async def upload_document(file: UploadFile = File(...)):
                 raise HTTPException(status_code=400, detail="Could not extract text from document")
 
             # Split into chunks
+            from langchain_text_splitters import RecursiveCharacterTextSplitter
             text_splitter = RecursiveCharacterTextSplitter(
                 chunk_size=1000,
                 chunk_overlap=200,
@@ -287,6 +343,10 @@ async def upload_document(file: UploadFile = File(...)):
 async def list_documents():
     """List all uploaded documents"""
     try:
+        vector_store = get_vector_store()
+        if not vector_store:
+            return []
+
         # Get all documents from vector store
         collection = vector_store.get()
         documents = {}
@@ -312,6 +372,10 @@ async def list_documents():
 async def delete_document(filename: str):
     """Delete a document and its embeddings"""
     try:
+        vector_store = get_vector_store()
+        if not vector_store:
+            raise HTTPException(status_code=503, detail="Vector store not available")
+
         # Get all documents and filter by source
         collection = vector_store.get()
         if not collection or "ids" not in collection or "metadatas" not in collection:
