@@ -121,24 +121,63 @@ jobs:
 
       - name: Deploy Docker container to EC2
         env:
-          EC2_USER: ec2-user
-          EC2_IP: ${{ steps.get-ip.outputs.ec2_ip }}
+          EC2_INSTANCE_ID: ${{ env.EC2_INSTANCE_ID }}
+          AWS_REGION: ${{ env.AWS_REGION }}
           DOCKER_IMAGE: ${{ env.REGISTRY }}/${{ secrets.DOCKER_USERNAME }}/${{ env.IMAGE_NAME }}:latest
-          SSH_KEY: ${{ secrets.EC2_SSH_PRIVATE_KEY }}
         run: |
-          mkdir -p ~/.ssh
-          echo "$SSH_KEY" | base64 -d > ~/.ssh/aws-key.pem
-          chmod 600 ~/.ssh/aws-key.pem
-          ssh-keyscan -H $EC2_IP >> ~/.ssh/known_hosts 2>/dev/null
-          ssh -o StrictHostKeyChecking=no -i ~/.ssh/aws-key.pem $EC2_USER@$EC2_IP << 'DEPLOY_SCRIPT'
-          docker pull $DOCKER_IMAGE || true
-          docker stop rag-fullstack || true
-          docker rm rag-fullstack || true
-          docker run -d --name rag-fullstack -p 8000:8000 -p 8501:8501 --restart unless-stopped $DOCKER_IMAGE
-          sleep 5
-          docker ps | grep rag-fullstack
-          DEPLOY_SCRIPT
-          rm ~/.ssh/aws-key.pem
+          # Use AWS Systems Manager to run commands on EC2
+          COMMAND_ID=$(aws ssm send-command \
+            --instance-ids "$EC2_INSTANCE_ID" \
+            --region "$AWS_REGION" \
+            --document-name "AWS-RunShellScript" \
+            --parameters 'commands=[
+              "docker pull $DOCKER_IMAGE || true",
+              "docker stop rag-fullstack || true",
+              "docker rm rag-fullstack || true",
+              "docker run -d --name rag-fullstack -p 8000:8000 -p 8501:8501 --restart unless-stopped $DOCKER_IMAGE",
+              "sleep 5",
+              "docker ps | grep rag-fullstack"
+            ]' \
+            --query 'Command.CommandId' \
+            --output text)
+
+          echo "SSM Command ID: $COMMAND_ID"
+
+          # Wait for command to complete
+          for i in {1..30}; do
+            STATUS=$(aws ssm get-command-invocation \
+              --instance-id "$EC2_INSTANCE_ID" \
+              --command-id "$COMMAND_ID" \
+              --region "$AWS_REGION" \
+              --query 'Status' \
+              --output text)
+
+            if [ "$STATUS" = "Success" ]; then
+              echo "Deployment successful"
+              aws ssm get-command-invocation \
+                --instance-id "$EC2_INSTANCE_ID" \
+                --command-id "$COMMAND_ID" \
+                --region "$AWS_REGION" \
+                --query 'StandardOutputContent' \
+                --output text
+              exit 0
+            elif [ "$STATUS" = "Failed" ]; then
+              echo "Deployment failed"
+              aws ssm get-command-invocation \
+                --instance-id "$EC2_INSTANCE_ID" \
+                --command-id "$COMMAND_ID" \
+                --region "$AWS_REGION" \
+                --query 'StandardErrorContent' \
+                --output text
+              exit 1
+            fi
+
+            echo "Waiting... ($i/30) Status: $STATUS"
+            sleep 2
+          done
+
+          echo "Command timeout"
+          exit 1
 
       - name: Verify API is responsive
         env:
