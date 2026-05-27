@@ -121,63 +121,38 @@ jobs:
 
       - name: Deploy Docker container to EC2
         env:
-          EC2_INSTANCE_ID: ${{ env.EC2_INSTANCE_ID }}
-          AWS_REGION: ${{ env.AWS_REGION }}
+          EC2_USER: ec2-user
+          EC2_IP: ${{ steps.get-ip.outputs.ec2_ip }}
           DOCKER_IMAGE: ${{ env.REGISTRY }}/${{ secrets.DOCKER_USERNAME }}/${{ env.IMAGE_NAME }}:latest
+          SSH_KEY_B64: ${{ secrets.EC2_SSH_PRIVATE_KEY }}
         run: |
-          # Use AWS Systems Manager to run commands on EC2
-          COMMAND_ID=$(aws ssm send-command \
-            --instance-ids "$EC2_INSTANCE_ID" \
-            --region "$AWS_REGION" \
-            --document-name "AWS-RunShellScript" \
-            --parameters 'commands=[
-              "docker pull $DOCKER_IMAGE || true",
-              "docker stop rag-fullstack || true",
-              "docker rm rag-fullstack || true",
-              "docker run -d --name rag-fullstack -p 8000:8000 -p 8501:8501 --restart unless-stopped $DOCKER_IMAGE",
-              "sleep 5",
-              "docker ps | grep rag-fullstack"
-            ]' \
-            --query 'Command.CommandId' \
-            --output text)
+          mkdir -p ~/.ssh
+          echo "$SSH_KEY_B64" | base64 -d > ~/.ssh/aws-key.pem
+          chmod 600 ~/.ssh/aws-key.pem
 
-          echo "SSM Command ID: $COMMAND_ID"
+          # Add EC2 to known_hosts
+          ssh-keyscan -H "$EC2_IP" 2>/dev/null >> ~/.ssh/known_hosts || true
 
-          # Wait for command to complete
-          for i in {1..30}; do
-            STATUS=$(aws ssm get-command-invocation \
-              --instance-id "$EC2_INSTANCE_ID" \
-              --command-id "$COMMAND_ID" \
-              --region "$AWS_REGION" \
-              --query 'Status' \
-              --output text)
+          # Deploy with SSH
+          ssh \
+            -o StrictHostKeyChecking=accept-new \
+            -o UserKnownHostsFile=~/.ssh/known_hosts \
+            -o IdentityFile=~/.ssh/aws-key.pem \
+            "$EC2_USER@$EC2_IP" << 'EOF'
+          docker pull $DOCKER_IMAGE || true
+          docker stop rag-fullstack 2>/dev/null || true
+          docker rm rag-fullstack 2>/dev/null || true
+          docker run -d \
+            --name rag-fullstack \
+            -p 8000:8000 \
+            -p 8501:8501 \
+            --restart unless-stopped \
+            $DOCKER_IMAGE
+          sleep 3
+          docker ps | grep rag-fullstack
+          EOF
 
-            if [ "$STATUS" = "Success" ]; then
-              echo "Deployment successful"
-              aws ssm get-command-invocation \
-                --instance-id "$EC2_INSTANCE_ID" \
-                --command-id "$COMMAND_ID" \
-                --region "$AWS_REGION" \
-                --query 'StandardOutputContent' \
-                --output text
-              exit 0
-            elif [ "$STATUS" = "Failed" ]; then
-              echo "Deployment failed"
-              aws ssm get-command-invocation \
-                --instance-id "$EC2_INSTANCE_ID" \
-                --command-id "$COMMAND_ID" \
-                --region "$AWS_REGION" \
-                --query 'StandardErrorContent' \
-                --output text
-              exit 1
-            fi
-
-            echo "Waiting... ($i/30) Status: $STATUS"
-            sleep 2
-          done
-
-          echo "Command timeout"
-          exit 1
+          rm ~/.ssh/aws-key.pem
 
       - name: Verify API is responsive
         env:

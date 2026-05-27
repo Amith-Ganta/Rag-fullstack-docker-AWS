@@ -11,6 +11,24 @@ from typing import List, Optional
 import os
 from dotenv import load_dotenv
 import logging
+import tempfile
+from pathlib import Path
+from datetime import datetime
+
+# LangChain imports
+from langchain_community.document_loaders import (
+    PyPDFLoader,
+    TextLoader,
+    UnstructuredWordDocumentLoader,
+)
+from langchain_community.vectorstores import Chroma
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langchain_community.embeddings import HuggingFaceEmbeddings
+from langchain_groq import ChatGroq
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.runnables import RunnablePassthrough
+from langchain_core.output_parsers import StrOutputParser
+from tavily import TavilyClient
 
 # Load environment variables
 load_dotenv()
@@ -18,6 +36,27 @@ load_dotenv()
 # Setup logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+# Initialize embeddings and vector store
+embeddings = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
+persist_directory = "/tmp/chroma_db"
+os.makedirs(persist_directory, exist_ok=True)
+vector_store = Chroma(
+    embedding_function=embeddings,
+    persist_directory=persist_directory,
+    collection_name="documents",
+)
+
+# Initialize LLM
+groq_api_key = os.getenv("GROQ_API_KEY", "")
+if groq_api_key:
+    llm = ChatGroq(model="mixtral-8x7b-32768", api_key=groq_api_key, temperature=0.7)
+else:
+    llm = None
+
+# Initialize Tavily for web search
+tavily_api_key = os.getenv("TAVILY_API_KEY", "")
+tavily_client = TavilyClient(api_key=tavily_api_key) if tavily_api_key else None
 
 # Initialize FastAPI app
 app = FastAPI(
@@ -92,24 +131,74 @@ async def query_rag(request: QueryRequest):
         - confidence: Confidence score of the answer
     """
     try:
-        # TODO: Implement RAG logic
-        # 1. Embed question
-        # 2. Search vector database for relevant documents
-        # 3. Optionally search web using Tavily
-        # 4. Pass context to LLM
-        # 5. Return answer with sources
+        if not llm:
+            raise HTTPException(
+                status_code=503,
+                detail="LLM not configured. Please set GROQ_API_KEY environment variable."
+            )
 
         logger.info(f"Processing query: {request.question}")
 
-        # Placeholder response
-        return QueryResponse(
-            question=request.question,
-            answer="This is a placeholder response. Implement RAG logic in the endpoint.",
-            sources=["document1.pdf", "document2.pdf"],
-            model_used=request.model,
-            confidence=0.75,
+        # Search for relevant documents
+        retriever = vector_store.as_retriever(search_kwargs={"k": 3})
+        docs = retriever.invoke(request.question)
+
+        sources = list(set([doc.metadata.get("source", "unknown") for doc in docs]))
+        context = "\n".join([doc.page_content for doc in docs])
+
+        # Optionally search web
+        web_context = ""
+        if request.use_web_search and tavily_client:
+            try:
+                results = tavily_client.search(query=request.question, max_results=3)
+                web_context = "\n".join([r["content"] for r in results.get("results", [])])
+                sources.extend([r["url"] for r in results.get("results", [])])
+            except Exception as e:
+                logger.warning(f"Web search failed: {e}")
+
+        # Build RAG prompt
+        prompt = ChatPromptTemplate.from_template(
+            """Use the following context to answer the question. If the context doesn't contain
+            relevant information, use your knowledge but indicate that it's from your training data.
+
+            Context:
+            {context}
+
+            Web Search Results (if available):
+            {web_context}
+
+            Question: {question}
+
+            Answer:"""
         )
 
+        # Create RAG chain
+        rag_chain = (
+            {
+                "context": lambda x: context,
+                "web_context": lambda x: web_context,
+                "question": RunnablePassthrough(),
+            }
+            | prompt
+            | llm
+            | StrOutputParser()
+        )
+
+        # Generate answer
+        answer = rag_chain.invoke(request.question)
+
+        confidence = 0.85 if context else 0.6
+
+        return QueryResponse(
+            question=request.question,
+            answer=answer,
+            sources=list(set(sources))[:5],
+            model_used=request.model,
+            confidence=confidence,
+        )
+
+    except HTTPException as e:
+        raise e
     except Exception as e:
         logger.error(f"Error processing query: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
@@ -135,20 +224,57 @@ async def upload_document(file: UploadFile = File(...)):
                 detail=f"Unsupported file type: {file_ext}. Allowed: {allowed_extensions}"
             )
 
-        # TODO: Implement document indexing
-        # 1. Save file to storage
-        # 2. Extract text from document
-        # 3. Split into chunks
-        # 4. Generate embeddings
-        # 5. Store in vector database
-
         logger.info(f"Uploading document: {file.filename}")
 
-        return {
-            "status": "success",
-            "filename": file.filename,
-            "message": "Document uploaded and indexed successfully",
-        }
+        # Save file to temporary location
+        with tempfile.NamedTemporaryFile(delete=False, suffix=file_ext) as tmp_file:
+            content = await file.read()
+            tmp_file.write(content)
+            tmp_path = tmp_file.name
+
+        try:
+            # Load and extract text based on file type
+            docs = []
+            if file_ext == ".pdf":
+                loader = PyPDFLoader(tmp_path)
+                docs = loader.load()
+            elif file_ext == ".txt":
+                loader = TextLoader(tmp_path)
+                docs = loader.load()
+            elif file_ext == ".docx":
+                loader = UnstructuredWordDocumentLoader(tmp_path)
+                docs = loader.load()
+
+            if not docs:
+                raise HTTPException(status_code=400, detail="Could not extract text from document")
+
+            # Split into chunks
+            text_splitter = RecursiveCharacterTextSplitter(
+                chunk_size=1000,
+                chunk_overlap=200,
+            )
+            chunks = text_splitter.split_documents(docs)
+
+            # Add metadata
+            for chunk in chunks:
+                chunk.metadata["source"] = file.filename
+                chunk.metadata["upload_date"] = datetime.now().isoformat()
+
+            # Store in vector database
+            vector_store.add_documents(chunks)
+            logger.info(f"Successfully indexed {len(chunks)} chunks from {file.filename}")
+
+            return {
+                "status": "success",
+                "filename": file.filename,
+                "chunks_created": len(chunks),
+                "message": "Document uploaded and indexed successfully",
+            }
+
+        finally:
+            # Clean up temporary file
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
 
     except HTTPException as e:
         raise e
@@ -160,15 +286,60 @@ async def upload_document(file: UploadFile = File(...)):
 @app.get("/documents", response_model=List[DocumentInfo])
 async def list_documents():
     """List all uploaded documents"""
-    # TODO: Implement document listing from database/storage
-    return []
+    try:
+        # Get all documents from vector store
+        collection = vector_store.get()
+        documents = {}
+
+        if collection and "metadatas" in collection:
+            for metadata in collection["metadatas"]:
+                source = metadata.get("source", "unknown")
+                if source not in documents:
+                    documents[source] = {
+                        "filename": source,
+                        "size_bytes": 0,
+                        "upload_timestamp": metadata.get("upload_date", "unknown"),
+                    }
+
+        return [DocumentInfo(**doc) for doc in documents.values()]
+
+    except Exception as e:
+        logger.error(f"Error listing documents: {str(e)}")
+        return []
 
 
 @app.delete("/documents/{filename}")
 async def delete_document(filename: str):
     """Delete a document and its embeddings"""
-    # TODO: Implement document deletion
-    return {"status": "success", "deleted": filename}
+    try:
+        # Get all documents and filter by source
+        collection = vector_store.get()
+        if not collection or "ids" not in collection or "metadatas" not in collection:
+            raise HTTPException(status_code=404, detail="Document not found")
+
+        ids_to_delete = []
+        for idx, metadata in enumerate(collection["metadatas"]):
+            if metadata.get("source") == filename:
+                ids_to_delete.append(collection["ids"][idx])
+
+        if not ids_to_delete:
+            raise HTTPException(status_code=404, detail=f"Document '{filename}' not found")
+
+        # Delete from vector store
+        vector_store.delete(ids=ids_to_delete)
+        logger.info(f"Deleted {len(ids_to_delete)} chunks for document: {filename}")
+
+        return {
+            "status": "success",
+            "deleted": filename,
+            "chunks_removed": len(ids_to_delete),
+        }
+
+    except HTTPException as e:
+        raise e
+    except Exception as e:
+        logger.error(f"Error deleting document: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.get("/models")
