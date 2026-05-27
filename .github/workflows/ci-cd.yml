@@ -124,19 +124,18 @@ jobs:
           EC2_USER: ec2-user
           EC2_IP: ${{ steps.get-ip.outputs.ec2_ip }}
           DOCKER_IMAGE: ${{ env.REGISTRY }}/${{ secrets.DOCKER_USERNAME }}/${{ env.IMAGE_NAME }}:latest
+          SSH_KEY: ${{ secrets.EC2_SSH_PRIVATE_KEY }}
         run: |
-          # Create SSH key from secret
+          # Create SSH key from secret (base64 decoded)
           mkdir -p ~/.ssh
-          cat > ~/.ssh/aws-key.pem << 'EOF'
-          ${{ secrets.EC2_SSH_PRIVATE_KEY }}
-          EOF
+          echo "$SSH_KEY" | base64 -d > ~/.ssh/aws-key.pem
           chmod 600 ~/.ssh/aws-key.pem
 
           # Add EC2 to known hosts
           ssh-keyscan -H $EC2_IP >> ~/.ssh/known_hosts 2>/dev/null
 
           # Deploy commands
-          ssh -i ~/.ssh/aws-key.pem $EC2_USER@$EC2_IP << 'DEPLOY_SCRIPT'
+          ssh -vvv -i ~/.ssh/aws-key.pem $EC2_USER@$EC2_IP << 'DEPLOY_SCRIPT'
           set -e
           echo "=== Pulling latest Docker image ==="
           docker pull $DOCKER_IMAGE || true
