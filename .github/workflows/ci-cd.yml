@@ -126,38 +126,18 @@ jobs:
           DOCKER_IMAGE: ${{ env.REGISTRY }}/${{ secrets.DOCKER_USERNAME }}/${{ env.IMAGE_NAME }}:latest
           SSH_KEY: ${{ secrets.EC2_SSH_PRIVATE_KEY }}
         run: |
-          # Create SSH key from secret (base64 decoded)
           mkdir -p ~/.ssh
           echo "$SSH_KEY" | base64 -d > ~/.ssh/aws-key.pem
           chmod 600 ~/.ssh/aws-key.pem
-
-          # Add EC2 to known hosts
           ssh-keyscan -H $EC2_IP >> ~/.ssh/known_hosts 2>/dev/null
-
-          # Deploy commands
-          ssh -vvv -i ~/.ssh/aws-key.pem $EC2_USER@$EC2_IP << 'DEPLOY_SCRIPT'
-          set -e
-          echo "=== Pulling latest Docker image ==="
+          ssh -o StrictHostKeyChecking=no -i ~/.ssh/aws-key.pem $EC2_USER@$EC2_IP << 'DEPLOY_SCRIPT'
           docker pull $DOCKER_IMAGE || true
-
-          echo "=== Stopping old container ==="
           docker stop rag-fullstack || true
           docker rm rag-fullstack || true
-
-          echo "=== Starting new container ==="
-          docker run -d \
-            --name rag-fullstack \
-            -p 8000:8000 \
-            -p 8501:8501 \
-            --restart unless-stopped \
-            $DOCKER_IMAGE
-
-          echo "=== Verifying deployment ==="
+          docker run -d --name rag-fullstack -p 8000:8000 -p 8501:8501 --restart unless-stopped $DOCKER_IMAGE
           sleep 5
-          docker ps | grep rag-fullstack || exit 1
-          echo "=== Deployment successful ==="
+          docker ps | grep rag-fullstack
           DEPLOY_SCRIPT
-
           rm ~/.ssh/aws-key.pem
 
       - name: Verify API is responsive
