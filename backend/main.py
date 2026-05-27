@@ -164,10 +164,14 @@ async def query_rag(request: QueryRequest):
         llm = get_llm()
         vector_store = get_vector_store()
 
+        # If no LLM configured, return a placeholder response
         if not llm:
-            raise HTTPException(
-                status_code=503,
-                detail="LLM not configured. Please set GROQ_API_KEY environment variable."
+            return QueryResponse(
+                question=request.question,
+                answer="LLM API key not configured. Please set GROQ_API_KEY environment variable to enable RAG functionality.",
+                sources=[],
+                model_used=request.model,
+                confidence=0.0,
             )
 
         logger.info(f"Processing query: {request.question}")
