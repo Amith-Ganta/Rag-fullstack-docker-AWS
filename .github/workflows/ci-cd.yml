@@ -11,7 +11,7 @@ env:
   REGISTRY: docker.io
   IMAGE_NAME: rag-fullstack-docker-aws
   AWS_REGION: us-east-1
-  EC2_INSTANCE_ID: i-0f790c856f47094cb
+  EC2_INSTANCE_ID: i-0dfd94bb05c033f95
 
 jobs:
   build-and-test:
@@ -121,7 +121,7 @@ jobs:
 
       - name: Deploy Docker container to EC2
         env:
-          EC2_USER: ec2-user
+          EC2_USER: ubuntu
           EC2_IP: ${{ steps.get-ip.outputs.ec2_ip }}
           DOCKER_IMAGE: ${{ env.REGISTRY }}/${{ secrets.DOCKER_USERNAME }}/${{ env.IMAGE_NAME }}:latest
           SSH_KEY_B64: ${{ secrets.EC2_SSH_PRIVATE_KEY }}
@@ -138,19 +138,32 @@ jobs:
             -o StrictHostKeyChecking=accept-new \
             -o UserKnownHostsFile=~/.ssh/known_hosts \
             -o IdentityFile=~/.ssh/aws-key.pem \
-            "$EC2_USER@$EC2_IP" << 'EOF'
+            "$EC2_USER@$EC2_IP" << 'ENDDEPLOY'
           docker pull $DOCKER_IMAGE || true
-          docker stop rag-fullstack 2>/dev/null || true
-          docker rm rag-fullstack 2>/dev/null || true
+          docker stop rag-backend rag-frontend 2>/dev/null || true
+          docker rm rag-backend rag-frontend 2>/dev/null || true
+
           docker run -d \
-            --name rag-fullstack \
-            -p 8000:8000 \
-            -p 8501:8501 \
+            --name rag-backend \
+            -p 9000:8000 \
             --restart unless-stopped \
-            $DOCKER_IMAGE
+            -e GROQ_API_KEY="${GROQ_API_KEY}" \
+            -e TAVILY_API_KEY="${TAVILY_API_KEY}" \
+            $DOCKER_IMAGE \
+            python -m uvicorn backend.main:app --host 0.0.0.0 --port 8000
+
+          docker run -d \
+            --name rag-frontend \
+            -p 9501:8501 \
+            --restart unless-stopped \
+            -e GROQ_API_KEY="${GROQ_API_KEY}" \
+            -e TAVILY_API_KEY="${TAVILY_API_KEY}" \
+            $DOCKER_IMAGE \
+            streamlit run frontend/app.py --server.port 8501 --server.address 0.0.0.0
+
           sleep 3
-          docker ps | grep rag-fullstack
-          EOF
+          docker ps -a | grep -E "rag-backend|rag-frontend"
+          ENDDEPLOY
 
           rm ~/.ssh/aws-key.pem
 
@@ -160,14 +173,14 @@ jobs:
         run: |
           echo "Waiting for API to be ready..."
           for i in {1..30}; do
-            if curl -s http://${{ steps.get-ip.outputs.ec2_ip }}:8000/docs > /dev/null; then
-              echo "✓ API is ready"
+            if curl -s http://${{ steps.get-ip.outputs.ec2_ip }}:9000/health > /dev/null; then
+              echo "✓ RAG API is ready"
               exit 0
             fi
             echo "Waiting... ($i/30)"
             sleep 2
           done
-          echo "✗ API failed to respond"
+          echo "✗ RAG API failed to respond"
           exit 1
 
       - name: Create deployment status
@@ -175,8 +188,8 @@ jobs:
         run: |
           if [ "${{ job.status }}" = "success" ]; then
             echo "✓ Deployment successful"
-            echo "API: http://${{ steps.get-ip.outputs.ec2_ip }}:8000"
-            echo "Frontend: http://${{ steps.get-ip.outputs.ec2_ip }}:8501"
+            echo "RAG Backend: http://${{ steps.get-ip.outputs.ec2_ip }}:9000"
+            echo "RAG Frontend: http://${{ steps.get-ip.outputs.ec2_ip }}:9501"
           else
             echo "✗ Deployment failed"
             exit 1
