@@ -123,11 +123,13 @@ jobs:
         env:
           EC2_USER: ec2-user
           EC2_IP: ${{ steps.get-ip.outputs.ec2_ip }}
-          DOCKER_IMAGE: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
+          DOCKER_IMAGE: ${{ env.REGISTRY }}/${{ secrets.DOCKER_USERNAME }}/${{ env.IMAGE_NAME }}:latest
         run: |
           # Create SSH key from secret
           mkdir -p ~/.ssh
-          echo "${{ secrets.EC2_SSH_PRIVATE_KEY }}" > ~/.ssh/aws-key.pem
+          cat > ~/.ssh/aws-key.pem << 'EOF'
+          ${{ secrets.EC2_SSH_PRIVATE_KEY }}
+          EOF
           chmod 600 ~/.ssh/aws-key.pem
 
           # Add EC2 to known hosts
