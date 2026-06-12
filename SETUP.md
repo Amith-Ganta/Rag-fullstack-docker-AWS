@@ -57,15 +57,8 @@ Create `.env` file with:
 
 ```env
 # LLM Configuration
-LLM_PROVIDER=groq
-LLM_API_KEY=your_groq_api_key_here
-
-# Alternative LLM providers
-# LLM_PROVIDER=deepseek
-# LLM_API_KEY=your_deepseek_key_here
-
-# LLM_PROVIDER=openai
-# LLM_API_KEY=your_openai_key_here
+# Groq (Mixtral 8x7B) is the wired provider. Free key: https://console.groq.com
+GROQ_API_KEY=your_groq_api_key_here
 
 # Web Search
 TAVILY_API_KEY=your_tavily_api_key_here
@@ -271,10 +264,10 @@ docker build --no-cache -t rag-fullstack:latest .
 
 ```bash
 # Check EC2 instance status
-aws ec2 describe-instances --instance-ids i-0f790c856f47094cb
+aws ec2 describe-instances --instance-ids i-xxxxxxxxxxxxxxxxx
 
 # SSH to EC2 and check Docker
-ssh -i your-key.pem ec2-user@<instance-ip>
+ssh -i your-key.pem ubuntu@<instance-ip>
 docker ps
 docker logs rag-fullstack
 ```
