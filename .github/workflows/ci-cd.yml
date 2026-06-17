@@ -139,9 +139,24 @@ jobs:
             -o UserKnownHostsFile=~/.ssh/known_hosts \
             -o IdentityFile=~/.ssh/aws-key.pem \
             "$EC2_USER@$EC2_IP" << 'ENDDEPLOY'
-          docker pull amith98480/rag-fullstack-docker-aws:latest || true
-          docker stop rag-backend rag-frontend 2>/dev/null || true
-          docker rm rag-backend rag-frontend 2>/dev/null || true
+          set -e
+
+          # Tear down the old deployment FIRST so it releases the ports and
+          # so its image can be pruned. Force-remove by name and by anything
+          # still bound to our ports (covers restart-policy races).
+          docker rm -f rag-backend rag-frontend 2>/dev/null || true
+          for p in 9000 9501; do
+            cid=$(docker ps -q --filter "publish=$p")
+            [ -n "$cid" ] && docker rm -f $cid || true
+          done
+
+          # The box has run out of disk from old images/layers. Reclaim space
+          # BEFORE pulling so the new image has room to land.
+          docker image prune -af || true
+          docker builder prune -af 2>/dev/null || true
+          df -h / | tail -1
+
+          docker pull amith98480/rag-fullstack-docker-aws:latest
 
           docker run -d \
             --name rag-backend \
@@ -162,8 +177,19 @@ jobs:
             amith98480/rag-fullstack-docker-aws:latest \
             streamlit run frontend/app.py --server.port 8501 --server.address 0.0.0.0
 
-          sleep 5
+          sleep 8
           docker ps -a | grep -E "rag-backend|rag-frontend"
+
+          # Fail the deploy if either container is not actually running.
+          for c in rag-backend rag-frontend; do
+            state=$(docker inspect -f '{{.State.Status}}' $c 2>/dev/null || echo missing)
+            echo "$c -> $state"
+            if [ "$state" != "running" ]; then
+              echo "ERROR: $c is not running ($state). Logs:"
+              docker logs --tail 30 $c 2>&1 || true
+              exit 1
+            fi
+          done
           ENDDEPLOY
 
           rm ~/.ssh/aws-key.pem
