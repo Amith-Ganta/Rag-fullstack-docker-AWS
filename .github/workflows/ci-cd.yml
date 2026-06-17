@@ -11,7 +11,7 @@ env:
   REGISTRY: docker.io
   IMAGE_NAME: rag-fullstack-docker-aws
   AWS_REGION: us-east-1
-  EC2_INSTANCE_ID: i-0dfd94bb05c033f95
+  EC2_INSTANCE_ID: i-04997c6b8e05b1870
 
 jobs:
   build-and-test:
@@ -144,39 +144,58 @@ jobs:
             "$EC2_USER@$EC2_IP" << 'ENDDEPLOY'
           set -e
 
-          # Tear down the old deployment FIRST so it releases the ports and
-          # so its image can be pruned. Force-remove by name and by anything
-          # still bound to our ports (covers restart-policy races).
+          # t3.micro has only 1 GB RAM. Add 4 GB swap (idempotent) or the
+          # backend is OOM-killed when PyTorch loads the embedding model.
+          if ! sudo swapon --show | grep -q '/swapfile'; then
+            sudo fallocate -l 4G /swapfile || sudo dd if=/dev/zero of=/swapfile bs=1M count=4096
+            sudo chmod 600 /swapfile
+            sudo mkswap /swapfile
+            sudo swapon /swapfile
+            grep -q '/swapfile' /etc/fstab || echo '/swapfile none swap sw 0 0' | sudo tee -a /etc/fstab
+            sudo sysctl vm.swappiness=10
+          fi
+          free -h
+
+          # Tear down any previous deployment FIRST so it releases the ports.
           docker rm -f rag-backend rag-frontend 2>/dev/null || true
           for p in 9000 9501; do
             cid=$(docker ps -q --filter "publish=$p")
             [ -n "$cid" ] && docker rm -f $cid || true
           done
 
-          # The box has run out of disk from old images/layers. Reclaim space
-          # BEFORE pulling so the new image has room to land.
+          # Reclaim space from old images/layers before pulling.
           docker image prune -af || true
           docker builder prune -af 2>/dev/null || true
           df -h / | tail -1
 
           docker pull amith98480/rag-fullstack-docker-aws:latest
 
+          # Backend gets most of the memory (it loads torch); allow spill to swap.
           docker run -d \
             --name rag-backend \
             -p 9000:8000 \
             --restart unless-stopped \
+            --memory 700m \
+            --memory-swap 3g \
             -e GROQ_API_KEY="${{ secrets.GROQ_API_KEY }}" \
             -e OPENAI_API_KEY="${{ secrets.OPENAI_API_KEY }}" \
             -e TAVILY_API_KEY="${{ secrets.TAVILY_API_KEY }}" \
             -e ENVIRONMENT="production" \
+            -e OMP_NUM_THREADS="1" \
+            -e TOKENIZERS_PARALLELISM="false" \
             amith98480/rag-fullstack-docker-aws:latest \
             python -m uvicorn backend.main:app --host 0.0.0.0 --port 8000
 
+          # Frontend kept lean; it is just the Streamlit UI.
           docker run -d \
             --name rag-frontend \
             -p 9501:8501 \
             --restart unless-stopped \
+            --memory 250m \
+            --memory-swap 1g \
             -e API_URL="http://${{ steps.get-ip.outputs.ec2_ip }}:9000" \
+            -e STREAMLIT_BROWSER_GATHER_USAGE_STATS="false" \
+            -e STREAMLIT_SERVER_FILE_WATCHER_TYPE="none" \
             amith98480/rag-fullstack-docker-aws:latest \
             streamlit run frontend/app.py --server.port 8501 --server.address 0.0.0.0
 
