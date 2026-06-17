@@ -8,6 +8,14 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
     && rm -rf /var/lib/apt/lists/*
 
+# Install the CPU-ONLY build of PyTorch FIRST. sentence-transformers pulls in
+# torch, and the default wheel bundles CUDA + triton (~7 GB uncompressed) that
+# is useless here: there is no GPU and the LLM runs remotely via API. Installing
+# the CPU wheel up front satisfies the torch dependency so the main install does
+# not drag in the CUDA stack. Keeps the image small enough for a t3.micro.
+RUN pip install --no-cache-dir \
+    torch==2.2.2 --index-url https://download.pytorch.org/whl/cpu
+
 # Copy requirements and install all Python dependencies as root
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
