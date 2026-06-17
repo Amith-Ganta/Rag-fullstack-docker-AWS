@@ -326,6 +326,14 @@ async def upload_document(file: UploadFile = File(...)):
                 detail=f"Unsupported file type: {file_ext}. Allowed: {allowed_extensions}"
             )
 
+        # Validate the request before touching the backend. Read the upload up
+        # front: UploadFile.size is unreliable in container deploys (often None),
+        # so validate emptiness on the actual bytes. A bad request is a 400
+        # regardless of whether the vector store happens to be available.
+        content = await file.read()
+        if not content:
+            raise HTTPException(status_code=400, detail="Empty file")
+
         logger.info(f"Uploading document: {file.filename}")
         vector_store = get_vector_store()
 
@@ -334,12 +342,6 @@ async def upload_document(file: UploadFile = File(...)):
                 status_code=503,
                 detail="Vector store not available. Document indexing is disabled."
             )
-
-        # Read the upload up front. UploadFile.size is unreliable in container
-        # deploys (often None), so validate emptiness on the actual bytes.
-        content = await file.read()
-        if not content:
-            raise HTTPException(status_code=400, detail="Empty file")
 
         # Save file to temporary location
         with tempfile.NamedTemporaryFile(delete=False, suffix=file_ext) as tmp_file:
