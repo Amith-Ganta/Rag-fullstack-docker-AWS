@@ -25,14 +25,18 @@ logger = logging.getLogger(__name__)
 # Lazy initialization flags
 _embeddings = None
 _vector_store = None
-_llm = None
 _tavily_client = None
 
 def get_embeddings():
     global _embeddings
     if _embeddings is None:
         try:
-            from langchain_community.embeddings import HuggingFaceEmbeddings
+            # langchain_huggingface is the maintained import path; fall back to the
+            # community path on older installs.
+            try:
+                from langchain_huggingface import HuggingFaceEmbeddings
+            except ImportError:
+                from langchain_community.embeddings import HuggingFaceEmbeddings
             _embeddings = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
         except Exception as e:
             logger.error(f"Failed to initialize embeddings: {e}")
@@ -58,20 +62,61 @@ def get_vector_store():
             _vector_store = False
     return _vector_store if _vector_store else None
 
-def get_llm():
-    global _llm
-    if _llm is None:
-        try:
-            from langchain_groq import ChatGroq
+# Cache one client per provider so we don't rebuild on every request.
+_llm_cache = {}
+
+
+def get_llm(provider: str = "groq"):
+    """Return a chat LLM for the requested provider, or None if it can't be built.
+
+    Supported providers: "groq", "deepseek", "openai". Each needs its API key in
+    the environment; an unset key (or unknown provider) yields None and the caller
+    degrades gracefully.
+    """
+    provider = (provider or "groq").lower()
+    if provider in _llm_cache:
+        return _llm_cache[provider] or None
+
+    llm = None
+    try:
+        if provider == "groq":
             groq_api_key = os.getenv("GROQ_API_KEY", "")
             if groq_api_key:
-                _llm = ChatGroq(model="mixtral-8x7b-32768", api_key=groq_api_key, temperature=0.7)
-            else:
-                _llm = False
-        except Exception as e:
-            logger.error(f"Failed to initialize LLM: {e}")
-            _llm = False
-    return _llm if _llm else None
+                from langchain_groq import ChatGroq
+                # mixtral-8x7b-32768 was decommissioned by Groq; use a current model.
+                llm = ChatGroq(
+                    model="llama-3.3-70b-versatile",
+                    api_key=groq_api_key,
+                    temperature=0.7,
+                )
+        elif provider == "deepseek":
+            deepseek_api_key = os.getenv("DEEPSEEK_API_KEY", "")
+            if deepseek_api_key:
+                # DeepSeek exposes an OpenAI-compatible endpoint.
+                from langchain_openai import ChatOpenAI
+                llm = ChatOpenAI(
+                    model="deepseek-chat",
+                    api_key=deepseek_api_key,
+                    base_url="https://api.deepseek.com",
+                    temperature=0.7,
+                )
+        elif provider == "openai":
+            openai_api_key = os.getenv("OPENAI_API_KEY", "")
+            if openai_api_key:
+                from langchain_openai import ChatOpenAI
+                llm = ChatOpenAI(
+                    model="gpt-4o-mini",
+                    api_key=openai_api_key,
+                    temperature=0.7,
+                )
+        else:
+            logger.warning(f"Unknown LLM provider requested: {provider}")
+    except Exception as e:
+        logger.error(f"Failed to initialize LLM provider '{provider}': {e}")
+        llm = None
+
+    _llm_cache[provider] = llm if llm else False
+    return llm
 
 def get_tavily_client():
     global _tavily_client
@@ -161,7 +206,15 @@ async def query_rag(request: QueryRequest):
         - confidence: Confidence score of the answer
     """
     try:
-        llm = get_llm()
+        # Honor the provider the caller asked for; fall back to groq if it
+        # isn't configured, so a missing optional key doesn't break the app.
+        requested = (request.model or "groq").lower()
+        llm = get_llm(requested)
+        active_provider = requested
+        if not llm and requested != "groq":
+            llm = get_llm("groq")
+            active_provider = "groq"
+
         vector_store = get_vector_store()
 
         # If no LLM configured, return a placeholder response
@@ -242,7 +295,7 @@ async def query_rag(request: QueryRequest):
             question=request.question,
             answer=answer,
             sources=list(set(sources))[:5],
-            model_used=request.model,
+            model_used=active_provider,
             confidence=confidence,
         )
 
@@ -261,8 +314,8 @@ async def upload_document(file: UploadFile = File(...)):
     Supported formats: PDF, TXT, DOCX
     """
     try:
-        if file.size is None or file.size == 0:
-            raise HTTPException(status_code=400, detail="Empty file")
+        if not file.filename:
+            raise HTTPException(status_code=400, detail="No file provided")
 
         allowed_extensions = {".pdf", ".txt", ".docx"}
         file_ext = os.path.splitext(file.filename)[1].lower()
@@ -282,9 +335,14 @@ async def upload_document(file: UploadFile = File(...)):
                 detail="Vector store not available. Document indexing is disabled."
             )
 
+        # Read the upload up front. UploadFile.size is unreliable in container
+        # deploys (often None), so validate emptiness on the actual bytes.
+        content = await file.read()
+        if not content:
+            raise HTTPException(status_code=400, detail="Empty file")
+
         # Save file to temporary location
         with tempfile.NamedTemporaryFile(delete=False, suffix=file_ext) as tmp_file:
-            content = await file.read()
             tmp_file.write(content)
             tmp_path = tmp_file.name
 
