@@ -18,14 +18,14 @@ openai==1.51.0
 groq==0.11.0
 
 # Document Processing
-PyPDF2==3.0.1
+# pypdf is what langchain_community.PyPDFLoader actually imports (not PyPDF2).
+pypdf==4.2.0
 python-docx==0.8.11
 unstructured==0.11.0
 
 # Vector & Search
 # sentence-transformers 2.2.2 imports cached_download from huggingface_hub,
 # which was removed; 2.7+ uses the current API. chromadb bumped to match.
-pinecone-client==2.2.3
 sentence-transformers==2.7.0
 chromadb==0.5.3
 
@@ -40,10 +40,6 @@ numpy==1.24.3
 requests==2.31.0
 pydantic==2.8.2
 pydantic-settings==2.4.0
-
-# Database
-sqlalchemy==2.0.23
-psycopg2-binary==2.9.9
 
 # API Documentation
 # fastapi 0.111 requires python-multipart>=0.0.7
@@ -62,9 +58,3 @@ flake8==6.1.0
 mypy==1.7.1
 isort==5.13.2
 
-# Logging & Monitoring
-loguru==0.7.2
-
-# AWS
-boto3==1.29.7
-botocore==1.32.7
