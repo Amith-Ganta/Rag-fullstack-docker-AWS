@@ -147,6 +147,10 @@ jobs:
             --name rag-backend \
             -p 9000:8000 \
             --restart unless-stopped \
+            -e GROQ_API_KEY="${{ secrets.GROQ_API_KEY }}" \
+            -e OPENAI_API_KEY="${{ secrets.OPENAI_API_KEY }}" \
+            -e TAVILY_API_KEY="${{ secrets.TAVILY_API_KEY }}" \
+            -e ENVIRONMENT="production" \
             amith98480/rag-fullstack-docker-aws:latest \
             python -m uvicorn backend.main:app --host 0.0.0.0 --port 8000
 
@@ -154,6 +158,7 @@ jobs:
             --name rag-frontend \
             -p 9501:8501 \
             --restart unless-stopped \
+            -e API_URL="http://${{ steps.get-ip.outputs.ec2_ip }}:9000" \
             amith98480/rag-fullstack-docker-aws:latest \
             streamlit run frontend/app.py --server.port 8501 --server.address 0.0.0.0
 
