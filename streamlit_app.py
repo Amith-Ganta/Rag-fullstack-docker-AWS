@@ -106,20 +106,29 @@ def get_llm(provider: str, temperature: float):
 
 
 def web_search(question: str):
-    """Return (context_text, source_urls) from Tavily, or ('', []) if unavailable."""
+    """Run a Tavily search.
+
+    Returns (context_text, source_urls, error). On success error is None; on
+    failure context/urls are empty and error is a human-readable string so the
+    UI can tell the user *why* there were no web results (instead of silently
+    pretending web search ran).
+    """
     key = get_key("TAVILY_API_KEY")
     if not key:
-        return "", []
+        return "", [], "TAVILY_API_KEY not set"
     try:
         from tavily import TavilyClient
 
         client = TavilyClient(api_key=key)
-        results = client.search(query=question, max_results=3).get("results", [])
+        resp = client.search(query=question, max_results=3)
+        results = resp.get("results", []) if isinstance(resp, dict) else []
         context = "\n".join(r.get("content", "") for r in results)
         urls = [r.get("url", "") for r in results if r.get("url")]
-        return context, urls
-    except Exception:  # noqa: BLE001
-        return "", []
+        if not results:
+            return "", [], "Tavily returned no results"
+        return context, urls, None
+    except Exception as e:  # noqa: BLE001
+        return "", [], f"Tavily error: {e}"
 
 
 def index_uploaded_file(uploaded_file) -> int:
@@ -182,9 +191,9 @@ def answer_question(question, provider, temperature, use_web):
     except Exception:  # noqa: BLE001
         pass
 
-    web_context, web_sources = ("", [])
+    web_context, web_sources, web_error = ("", [], None)
     if use_web:
-        web_context, web_sources = web_search(question)
+        web_context, web_sources, web_error = web_search(question)
 
     from langchain_core.prompts import ChatPromptTemplate
     from langchain_core.output_parsers import StrOutputParser
@@ -213,6 +222,7 @@ def answer_question(question, provider, temperature, use_web):
         "sources": list({*doc_sources, *web_sources})[:5],
         "model_used": provider,
         "confidence": 0.85 if context else 0.6,
+        "web_error": web_error,
     }
 
 
@@ -264,6 +274,8 @@ with tab_qa:
                     result = answer_question(
                         question, provider, temperature, use_web
                     )
+                if use_web and result.get("web_error"):
+                    st.warning(f"🌐 Web search unavailable: {result['web_error']}")
                 st.markdown("### 📌 Answer")
                 st.write(result["answer"])
                 c1, c2, c3 = st.columns(3)
