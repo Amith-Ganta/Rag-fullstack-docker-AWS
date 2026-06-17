@@ -96,7 +96,10 @@ jobs:
     needs: build-docker
     runs-on: ubuntu-latest
     name: Deploy to AWS EC2
-    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    # Disabled on push: the deploy auto-targets EC2_INSTANCE_ID, and we are
+    # moving to a brand-new instance. Run manually (Actions -> Run workflow)
+    # only AFTER updating EC2_INSTANCE_ID to the new box.
+    if: github.event_name == 'workflow_dispatch'
 
     steps:
       - name: Checkout code
